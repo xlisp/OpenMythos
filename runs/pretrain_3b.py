@@ -92,6 +92,19 @@ def _run():
         device = "cuda" if torch.cuda.is_available() else "cpu"
     master = rank == 0
 
+    tb_writer = None
+    if master:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            tb_dir = os.environ.get(
+                "MYTHOS_TB_DIR", str(REPO / "logs" / "tb" / "pretrain")
+            )
+            os.makedirs(tb_dir, exist_ok=True)
+            tb_writer = SummaryWriter(tb_dir)
+            logger.info(f"[pretrain] tensorboard → {tb_dir}")
+        except ImportError:
+            logger.warning("[pretrain] tensorboard not installed; skipping TB logs")
+
     encoding = MythosTokenizer()
     vocab_size = encoding.vocab_size
 
@@ -203,6 +216,15 @@ def _run():
                 f"[pretrain] step {step}/{total_steps} loss {loss_acc:.4f} "
                 f"gnorm {float(gn):.2f} lr {cur_lr:.2e} {tps/1e6:.2f}M tok/s"
             )
+            if tb_writer:
+                tb_writer.add_scalar("pretrain/loss", loss_acc, step)
+                tb_writer.add_scalar("pretrain/grad_norm", float(gn), step)
+                tb_writer.add_scalar("pretrain/lr", cur_lr, step)
+                tb_writer.add_scalar("pretrain/tokens_per_sec", tps, step)
+                tb_writer.add_scalar(
+                    "pretrain/tokens_seen_B", step * global_batch_tok / 1e9, step
+                )
+                tb_writer.flush()
             t0 = time.perf_counter()
         if step % ckpt_every == 0:
             save_checkpoint(model, opt, step, cfg, vocab_size, ckpt_dir, ddp, master)
@@ -210,6 +232,8 @@ def _run():
     if step > start_step and step % ckpt_every != 0:
         save_checkpoint(model, opt, step, cfg, vocab_size, ckpt_dir, ddp, master)
 
+    if tb_writer:
+        tb_writer.close()
     if ddp:
         dist.barrier()
         dist.destroy_process_group()

@@ -230,6 +230,19 @@ def main():
         device = "cuda" if torch.cuda.is_available() else "cpu"
     master = rank == 0
 
+    tb_writer = None
+    if master:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            tb_dir = os.environ.get(
+                "MYTHOS_TB_DIR", str(REPO / "logs" / "tb" / "dpo")
+            )
+            os.makedirs(tb_dir, exist_ok=True)
+            tb_writer = SummaryWriter(tb_dir)
+            logger.info(f"[dpo] tensorboard → {tb_dir}")
+        except ImportError:
+            logger.warning("[dpo] tensorboard not installed; skipping TB logs")
+
     sft_dir = os.environ.get("MYTHOS_SFT_DIR", str(REPO / "checkpoints" / "sft"))
     dpo_dir = os.environ.get("MYTHOS_DPO_DIR", str(REPO / "checkpoints" / "dpo"))
     dataset_name = os.environ.get("MYTHOS_DPO_DATASET", "Intel/orca_dpo_pairs")
@@ -333,11 +346,17 @@ def main():
             step += 1
             if master and step % log_every == 0:
                 dt = time.perf_counter() - t0
+                acc_mean = acc_acc / grad_accum
                 logger.info(
                     f"[dpo] step {step} loss {loss_acc:.4f} "
-                    f"acc {acc_acc/grad_accum:.2%} gnorm {float(gn):.2f} "
-                    f"dt {dt:.1f}s"
+                    f"acc {acc_mean:.2%} gnorm {float(gn):.2f} dt {dt:.1f}s"
                 )
+                if tb_writer:
+                    tb_writer.add_scalar("dpo/loss", loss_acc, step)
+                    tb_writer.add_scalar("dpo/accuracy", acc_mean, step)
+                    tb_writer.add_scalar("dpo/grad_norm", float(gn), step)
+                    tb_writer.add_scalar("dpo/lr", opt.param_groups[0]["lr"], step)
+                    tb_writer.flush()
                 t0 = time.perf_counter()
             if step % ckpt_every == 0:
                 save_policy(policy, opt, step, cfg, vocab_size, dpo_dir, ddp, master)
@@ -347,6 +366,8 @@ def main():
 
     save_policy(policy, opt, max(step, 1), cfg, vocab_size, dpo_dir, ddp, master)
 
+    if tb_writer:
+        tb_writer.close()
     if ddp:
         dist.barrier()
         dist.destroy_process_group()

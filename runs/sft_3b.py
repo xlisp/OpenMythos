@@ -176,6 +176,19 @@ def main():
         device = "cuda" if torch.cuda.is_available() else "cpu"
     master = rank == 0
 
+    tb_writer = None
+    if master:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            tb_dir = os.environ.get(
+                "MYTHOS_TB_DIR", str(REPO / "logs" / "tb" / "sft")
+            )
+            os.makedirs(tb_dir, exist_ok=True)
+            tb_writer = SummaryWriter(tb_dir)
+            logger.info(f"[sft] tensorboard → {tb_dir}")
+        except ImportError:
+            logger.warning("[sft] tensorboard not installed; skipping TB logs")
+
     pretrain_dir = os.environ.get("MYTHOS_PRETRAIN_DIR",
                                   str(REPO / "checkpoints" / "pretrain"))
     sft_dir = os.environ.get("MYTHOS_SFT_DIR",
@@ -305,11 +318,16 @@ def main():
             step += 1
             if master and step % log_every == 0:
                 dt = time.perf_counter() - t0
+                cur_lr = opt.param_groups[0]["lr"]
                 logger.info(
                     f"[sft] step {step} loss {loss_acc:.4f} "
-                    f"gnorm {float(gn):.2f} lr {opt.param_groups[0]['lr']:.2e} "
-                    f"dt {dt:.1f}s"
+                    f"gnorm {float(gn):.2f} lr {cur_lr:.2e} dt {dt:.1f}s"
                 )
+                if tb_writer:
+                    tb_writer.add_scalar("sft/loss", loss_acc, step)
+                    tb_writer.add_scalar("sft/grad_norm", float(gn), step)
+                    tb_writer.add_scalar("sft/lr", cur_lr, step)
+                    tb_writer.flush()
                 t0 = time.perf_counter()
             if step % ckpt_every == 0:
                 save_ckpt(model, opt, step, cfg, vocab_size, sft_dir, ddp, master)
@@ -318,6 +336,8 @@ def main():
 
     save_ckpt(model, opt, step, cfg, vocab_size, sft_dir, ddp, master)
 
+    if tb_writer:
+        tb_writer.close()
     if ddp:
         dist.barrier()
         dist.destroy_process_group()

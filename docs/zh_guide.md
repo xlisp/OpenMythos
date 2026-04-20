@@ -96,41 +96,138 @@ expert_dim=4096           # 单个细粒度专家的隐层维度
 
 ## 4. A800 × 8 跑起来
 
-**硬件前提**：8 × A800 80GB（总 640GB HBM），NVLink/NVSwitch 节点内互联，CUDA 12+，PyTorch 2.3+。
+**硬件前提**：8 × A800 80GB（总 640GB HBM），NVLink/NVSwitch 节点内互联。
 
-### 4.1 环境准备
+**宿主软件前提（已由管理员安装，不需 root）**：
+- Python 3.12.3（系统）
+- torch 2.10.0+cu130（系统 site-packages）
+- CUDA 13（系统驱动与 runtime）
+
+> **不要用 `pip install torch`**：系统 torch 已适配 CUDA 13；我们只需把 `datasets / transformers / loguru / tensorboard` 叠加到用户态 venv。
+
+### 4.1 环境准备（用户态 venv，继承系统 torch）
+
+项目提供了 `runs/setup_env.sh`，一行搞定：
 
 ```bash
 cd OpenMythos
-pip install -r requirements.txt
-pip install -r training/requirements.txt
-# 关键依赖：torch, datasets, transformers, loguru
+bash runs/setup_env.sh
+source .venv/bin/activate
 ```
 
-可选：登录 HuggingFace 拉取 FineWeb-Edu（首次需访问）：
+它做的事：
+1. `python -m venv --system-site-packages .venv` —— 创建 venv 时**继承系统 site-packages**，直接复用系统的 `torch 2.10.0+cu130`；
+2. 打印 torch 版本、CUDA 可用性、GPU 数量做 sanity check；
+3. `pip install -U datasets transformers loguru tensorboard huggingface_hub` —— 只装业务依赖；
+4. 再次 import 验证各包版本。
+
+可选覆盖（非默认 python 路径时）：
+
+```bash
+PYTHON=/opt/python3.12/bin/python3 VENV=/data/.venv bash runs/setup_env.sh
+```
+
+登录 HuggingFace（首次拉取 FineWeb-Edu 等数据集时需要）：
 
 ```bash
 huggingface-cli login
 ```
 
-### 4.2 训练命令（直接可用）
+### 4.2 一键端到端（pretrain → SFT → DPO → REPL）
 
-脚本已经是 FSDP + `torchrun` 就绪的，默认跑 3B：
+项目在 `runs/` 下提供了完整编排脚本：
 
-```bash
-torchrun --standalone --nproc_per_node=8 \
-    training/3b_fine_web_edu.py
+```
+runs/
+├── setup_env.sh      # 上一步用到
+├── pretrain_3b.py    # FineWeb-Edu 预训练，FSDP + TensorBoard
+├── sft_3b.py         # Alpaca 指令微调，prompt-masked loss
+├── dpo_3b.py         # policy + 冻结 ref 的 DPO，偏好对
+├── eval_repl.py      # 交互式 REPL，调 n_loops / temperature / top_k
+└── run_all.sh        # 自动 nohup 后台编排器（本节主角）
 ```
 
-脚本会自动：
-- 初始化 NCCL 进程组；
-- 按 `ModuleWrapPolicy({TransformerBlock, RecurrentBlock})` 做 FULL_SHARD 分片；
-- A800 支持 bf16，混精度自动选 `torch.bfloat16`；
-- 按 `rank × num_workers` 分片流式拉取 FineWeb-Edu；
-- 每 1000 step 写 checkpoint 到 `./checkpoints/`，保留最近 3 份；
-- 自动从最新 checkpoint 续跑。
+默认启动（自动 nohup 到后台 + 自动起 TensorBoard server）：
 
-### 4.3 在 A800 × 8 上能跑多大
+```bash
+bash runs/run_all.sh
+```
+
+它会立即返回：
+
+```
+[run_all] PID=12345
+[run_all] log=logs/run_all_20260420_231512.log
+[run_all] tail:  tail -f logs/run_all_20260420_231512.log
+[run_all] stop:  kill 12345
+[run_all] tb:    tensorboard --logdir logs/tb --port 6006 --bind_all
+[run_all] repl:  python runs/eval_repl.py   (after stages finish)
+```
+
+内部逻辑：
+- 首次调用时 `exec` 一次自身到 `nohup ... &`，父进程立刻退出，不会因为终端断开被 kill；
+- 激活 `.venv`，按 `nvidia-smi` 自动选 `NPROC=$(torch.cuda.device_count())`；
+- 顺序跑 `pretrain → sft → dpo`，每阶段单独写日志 `logs/{stage}_<时间戳>.log`；
+- `MYTHOS_TB_DIR` 按阶段分桶：`logs/tb/{pretrain,sft,dpo}`，TensorBoard server 后台拉起在 `:6006`；
+- REPL 是交互式的，后台模式下会**跳过**并提示手动起。
+
+**常用环境变量覆盖**（都可以 `VAR=... bash runs/run_all.sh` 传入）：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `STAGES` | `pretrain,sft,dpo,repl` | 只跑子集，例如 `STAGES=sft,dpo` |
+| `FOREGROUND` | `0` | `=1` 不 nohup，在当前 shell 跑（调试用） |
+| `NPROC` | 自动 | 覆盖 GPU 数 |
+| `VENV` | `./.venv` | venv 路径 |
+| `TB_PORT` | `6006` | TensorBoard 端口 |
+| `START_TB` | `1` | `=0` 不自动起 TB server |
+| `MYTHOS_TARGET_TOKENS` | `30000000000` | 预训练目标 token 数；冒烟测试可设 `50000000` |
+| `MYTHOS_SFT_EPOCHS` | `2` | SFT 轮数 |
+| `MYTHOS_DPO_BETA` | `0.1` | DPO 温度 |
+
+### 4.3 TensorBoard 监控
+
+三个阶段都在 master rank 写 `SummaryWriter` 事件：
+
+| 阶段 | 记录的标量 |
+|---|---|
+| `pretrain/*` | `loss`, `grad_norm`, `lr`, `tokens_per_sec`, `tokens_seen_B` |
+| `sft/*` | `loss`, `grad_norm`, `lr` |
+| `dpo/*` | `loss`, `accuracy`（policy 偏好 chosen 的比例）, `grad_norm`, `lr` |
+
+`run_all.sh` 默认已经起了 TB server，浏览器打开 `http://<节点 IP>:6006/` 直接看。若想手动起：
+
+```bash
+source .venv/bin/activate
+tensorboard --logdir logs/tb --port 6006 --bind_all
+```
+
+想只看某个阶段：`--logdir logs/tb/pretrain`。
+
+### 4.4 日志与后台运维
+
+```bash
+# 看总日志
+tail -f logs/run_all_*.log
+
+# 看某阶段详细日志
+tail -f logs/pretrain_*.log
+tail -f logs/sft_*.log
+tail -f logs/dpo_*.log
+
+# TensorBoard 自己的 server 日志
+tail -f logs/tensorboard.log
+
+# 查后台进程
+ps -p $(cat /tmp/openmythos.pid 2>/dev/null) 2>/dev/null || pgrep -f 'runs/run_all.sh'
+
+# 停止
+kill <PID>
+```
+
+断点：所有三个阶段都实现了 `_list_ckpts(...)` 自动发现最新 ckpt 续跑；杀掉进程再 `bash runs/run_all.sh` 即可从断点继续。
+
+### 4.5 在 A800 × 8 上能跑多大
 
 以下为经验估计（FSDP FULL_SHARD + bf16 + 激活检查点，大致可行性）：
 
@@ -143,24 +240,26 @@ torchrun --standalone --nproc_per_node=8 \
 
 推荐从 **`mythos_3b`** 起步把流程跑通，再换 `mythos_10b`。
 
-### 4.4 超参数调整建议（脚本里是常量）
+### 4.6 超参数调整（通过环境变量，不用改代码）
 
-在 `training/3b_fine_web_edu.py` 的 `main()` 里：
+`runs/pretrain_3b.py` 已把常用超参暴露为环境变量，`run_all.sh` 透传：
 
-```python
-seq_len = 2048            # 3B+8GPU 吞吐/显存平衡点
-micro_batch = 4           # 显存够可升 8
-target_tokens = 30_000_000_000   # 目标 30B tokens（循环模型 Chinchilla 调整后）
-grad_accum = max(1, 256 // (world_size * micro_batch))
-warmup_steps = 2000
-lr = 3e-4
-wd = 0.1
-dataset_subset = "sample-10BT"   # → "sample-100BT" / "default"
+```bash
+MYTHOS_SUBSET=sample-100BT \
+MYTHOS_TARGET_TOKENS=100000000000 \
+MYTHOS_SEQ_LEN=2048 \
+MYTHOS_MICRO_BATCH=4 \
+MYTHOS_WARMUP=2000 \
+MYTHOS_LR=3e-4 \
+MYTHOS_CKPT_EVERY=1000 \
+    bash runs/run_all.sh
 ```
 
-有效全局 batch（tokens）= `world_size × micro_batch × grad_accum × seq_len`，默认约 **524k tokens/步**。
+SFT / DPO 同理：`MYTHOS_SFT_LR`, `MYTHOS_SFT_EPOCHS`, `MYTHOS_DPO_LR`, `MYTHOS_DPO_BETA`, `MYTHOS_DPO_DATASET` …
 
-### 4.5 常见坑位
+有效全局 batch（tokens）= `world_size × micro_batch × grad_accum × seq_len`，默认 `8×4×8×2048 ≈ 524k tokens/步`。
+
+### 4.7 常见坑位
 
 - **checkpoint 恢复**：FSDP 下模型和优化器必须在**同一个** `FULL_STATE_DICT` 上下文内 gather，否则会 silent 错位。代码里已经处理好，但若你改写这一段请保留该模式。
 - **数据流式不可 seek**：断点重启时 dataset 会从头重拉，预训练规模下可接受。
